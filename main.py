@@ -283,7 +283,7 @@ class SpriteToGifPlugin(Star):
                 return
 
             nodes_list = []
-            sender_name = "裁剪助手"
+            sender_name = "裁剪"
 
             for r in range(rows):
                 for c in range(cols):
