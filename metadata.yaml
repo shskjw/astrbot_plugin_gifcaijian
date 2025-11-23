@@ -2,6 +2,6 @@
     "name": "astrbot_plugin_gifcaijian",
     "desc": "可以裁剪和合并gif",
     "author": "shskjw",
-    "repo": "https://github.com/shkjw/astrbot_plugin_gifcaijian",
-    "version": "1.0.0"
+    "repo": "https://github.com/shskjw/astrbot_plugin_gifcaijian",
+    "version": "1.0.1"
 }
