@@ -1,17 +1,17 @@
 import re
 import io
-import asyncio
 import aiohttp
 from PIL import Image as PILImage, ImageSequence
 from astrbot.api.event import filter
 from astrbot.api.all import *
 import astrbot.api.message_components as Comp
 
+
 @register(
     "astrbot_plugin_gifcaijian",
     "shskjw",
-    "可以裁剪和合并gif",
-    "1.0.1",
+    "可以裁剪和合并gif，支持指定边距裁剪",
+    "1.2.0",
     "https://github.com/shkjw/astrbot_plugin_gifcaijian",
 )
 class SpriteToGifPlugin(Star):
@@ -44,27 +44,93 @@ class SpriteToGifPlugin(Star):
                     return None
                 return await resp.read()
 
+    # --- 解析边距指令 ---
+    def _parse_margins(self, text: str):
+        """
+        从文本中提取边距指令，返回 (清理后的文本, 边距字典)
+        支持格式：边距左边2, 边距右2, 边距上边5, 边距下10
+        """
+        margins = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
+        
+        # 正则匹配：边距 + (上下左右) + (可选'边') + 数字
+        pattern = r'边距\s*([上下左右])?边?\s*(\d+)'
+        
+        matches = re.findall(pattern, text)
+        for direction, amount_str in matches:
+            try:
+                amount = int(amount_str)
+                if not direction: 
+                    # 如果没写方向（如"边距10"），默认四周都剪
+                    margins['top'] += amount
+                    margins['bottom'] += amount
+                    margins['left'] += amount
+                    margins['right'] += amount
+                elif direction == '上': margins['top'] += amount
+                elif direction == '下': margins['bottom'] += amount
+                elif direction == '左': margins['left'] += amount
+                elif direction == '右': margins['right'] += amount
+            except ValueError:
+                pass
+
+        # 将匹配到的边距指令从文本中移除
+        clean_text = re.sub(pattern, " ", text)
+        return clean_text, margins
+
+    # --- 应用边距裁剪 ---
+    def _crop_image_data(self, img_data: bytes, margins: dict) -> tuple[bytes, str]:
+        """
+        对图片数据应用边距裁剪
+        返回: (新的图片bytes, 提示信息)
+        """
+        if all(v == 0 for v in margins.values()):
+            return img_data, ""
+
+        try:
+            img = PILImage.open(io.BytesIO(img_data))
+            img = img.convert("RGBA")
+            width, height = img.size
+
+            left = margins['left']
+            upper = margins['top']
+            right = width - margins['right']
+            lower = height - margins['bottom']
+
+            if left >= right or upper >= lower:
+                return img_data, f"\n⚠️ 边距裁剪无效(范围越界): {width}x{height} -> {left},{upper},{right},{lower}"
+
+            # 执行裁剪
+            cropped_img = img.crop((left, upper, right, lower))
+            
+            output = io.BytesIO()
+            cropped_img.save(output, format='PNG')
+            new_data = output.getvalue()
+            
+            msg = f"\n✂️ 已裁边距: 上{margins['top']} 下{margins['bottom']} 左{margins['left']} 右{margins['right']}"
+            return new_data, msg
+        except Exception as e:
+            return img_data, f"\n⚠️ 边距裁剪出错: {e}"
+
     async def _handle_gif_task(self, event: AstrMessageEvent, algorithm_mode: int):
         msg_text = event.message_str
-        
-        clean_text = msg_text.replace("合成1gif", "").replace("合成2gif", "").replace("合成gif", "")
+
+        # 1. 预处理：提取边距
+        clean_text, margins = self._parse_margins(msg_text)
+
+        # 2. 清理文本
+        clean_text = clean_text.replace("合成1gif", "").replace("合成2gif", "").replace("合成gif", "")
 
         rows = 6
         cols = 6
         duration = 0.1
-        margin = 0
 
+        # 3. 解析行列 (如果没有指定，保持默认6x6，不变成1x1)
         grid_match = re.search(r'(\d+)\s*[*x×]\s*(\d+)', clean_text)
         if grid_match:
             rows = int(grid_match.group(1))
             cols = int(grid_match.group(2))
             clean_text = clean_text.replace(grid_match.group(0), " ")
-        
-        margin_match = re.search(r'(?:边距|margin|gap)\s*(\d+)', clean_text)
-        if margin_match:
-            margin = int(margin_match.group(1))
-            clean_text = clean_text.replace(margin_match.group(0), " ")
 
+        # 4. 解析时间
         duration_match = re.search(r'(\d+(?:\.\d+)?)', clean_text)
         if duration_match:
             try:
@@ -79,23 +145,24 @@ class SpriteToGifPlugin(Star):
             yield event.plain_result("❌ 未检测到图片")
             return
 
-        try:
-            margin_info = f", 边距{margin}px" if margin > 0 else ""
-            yield event.plain_result(f"⏳ 正在合成(算法{algorithm_mode})... ({rows}x{cols}, 每帧{duration}秒{margin_info})")
-            await asyncio.sleep(0.5)
-        except Exception:
-            return
-        
+        yield event.plain_result(f"⏳ 正在合成(算法{algorithm_mode})... ({rows}x{cols}, 每帧{duration}秒)")
+
         img_data = await self._download_image(img_url)
         if not img_data:
             yield event.plain_result("❌ 图片下载失败")
             return
 
+        # 5. 应用边距裁剪
+        img_data, crop_msg = self._crop_image_data(img_data, margins)
+
+        # 6. 处理GIF
         if algorithm_mode == 1:
-            result_msg, gif_bytes = await asyncio.to_thread(self.process_mode_1, img_data, rows, cols, duration, margin)
+            result_msg, gif_bytes = self.process_mode_1(img_data, rows, cols, duration)
         else:
-            result_msg, gif_bytes = await asyncio.to_thread(self.process_mode_2, img_data, rows, cols, duration, margin)
-        
+            result_msg, gif_bytes = self.process_mode_2(img_data, rows, cols, duration)
+            
+        result_msg += crop_msg
+
         if gif_bytes:
             yield event.chain_result([Comp.Plain(result_msg), Comp.Image.fromBytes(gif_bytes.getvalue())])
         else:
@@ -111,53 +178,46 @@ class SpriteToGifPlugin(Star):
         async for res in self._handle_gif_task(event, 2):
             yield res
 
-    def process_mode_1(self, img_data: bytes, rows: int, cols: int, duration_sec: float, margin: int):
+    def process_mode_1(self, img_data: bytes, rows: int, cols: int, duration_sec: float):
         try:
             img = PILImage.open(io.BytesIO(img_data))
             if getattr(img, "is_animated", False): img.seek(0)
             img = img.convert("RGBA")
             width, height = img.size
-            
+
             disposal_method = 0
             extrema = img.getextrema()
             if extrema[3][0] < 255:
                 disposal_method = 2
-            
-            content_width = width - (cols - 1) * margin
-            content_height = height - (rows - 1) * margin
-            
-            cell_width = content_width // cols
-            cell_height = content_height // rows
-            
-            info_msg = f"算法1 | 原图:{width}x{height} | 切割:{rows}行{cols}列 | 边距:{margin}"
-            
-            if cell_width < 2 or cell_height < 2: 
-                return f"⚠️ 计算后单格太小 ({cell_width}x{cell_height})，请检查边距是否过大", None
+
+            cell_width, cell_height = width // cols, height // rows
+            info_msg = f"算法1(标准) | 尺寸:{width}x{height} | 切割:{rows}行{cols}列"
+
+            if cell_width < 2 or cell_height < 2: return f"⚠️ 单格太小 ({cell_width}x{cell_height})", None
 
             frames = []
             for r in range(rows):
                 for c in range(cols):
-                    left = c * (cell_width + margin)
-                    upper = r * (cell_height + margin)
-                    right = left + cell_width
-                    lower = upper + cell_height
-                    
-                    frames.append(img.crop((left, upper, right, lower)))
+                    frames.append(
+                        img.crop((c * cell_width, r * cell_height, (c + 1) * cell_width, (r + 1) * cell_height)))
 
             output = io.BytesIO()
             duration_ms = int(duration_sec * 1000)
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms, loop=0, disposal=disposal_method, dither=PILImage.Dither.NONE, optimize=False)
+
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms, loop=0,
+                           disposal=disposal_method, dither=PILImage.Dither.NONE, optimize=False)
             output.seek(0)
             return f"✅ 合成成功\n{info_msg}", output
-        except Exception as e: return f"逻辑异常: {str(e)}", None
+        except Exception as e:
+            return f"逻辑异常: {str(e)}", None
 
-    def process_mode_2(self, img_data: bytes, rows: int, cols: int, duration_sec: float, margin: int):
+    def process_mode_2(self, img_data: bytes, rows: int, cols: int, duration_sec: float):
         try:
             img = PILImage.open(io.BytesIO(img_data))
             if getattr(img, "is_animated", False): img.seek(0)
             img = img.convert("RGBA")
             width, height = img.size
-            
+
             datas = img.getdata()
             new_data = []
             has_transparency = False
@@ -174,28 +234,18 @@ class SpriteToGifPlugin(Star):
             else:
                 master_palette = img.convert("RGB").quantize(colors=256, method=1, dither=PILImage.Dither.NONE)
 
-            content_width = width - (cols - 1) * margin
-            content_height = height - (rows - 1) * margin
-            cell_width = content_width // cols
-            cell_height = content_height // rows
+            cell_width, cell_height = width // cols, height // rows
+            info_msg = f"算法2(高级) | 尺寸:{width}x{height} | 切割:{rows}行{cols}列"
 
-            info_msg = f"算法2 | 原图:{width}x{height} | 切割:{rows}行{cols}列 | 边距:{margin}"
-            
-            if cell_width < 2 or cell_height < 2: 
-                return f"⚠️ 计算后单格太小 ({cell_width}x{cell_height})，请检查边距是否过大", None
+            if cell_width < 2 or cell_height < 2: return f"⚠️ 单格太小 ({cell_width}x{cell_height})", None
 
             frames = []
             for r in range(rows):
                 for c in range(cols):
-                    left = c * (cell_width + margin)
-                    upper = r * (cell_height + margin)
-                    right = left + cell_width
-                    lower = upper + cell_height
-
-                    box = (left, upper, right, lower)
+                    box = (c * cell_width, r * cell_height, (c + 1) * cell_width, (r + 1) * cell_height)
                     crop_rgba = img.crop(box)
                     frame_p = crop_rgba.convert("RGB").quantize(palette=master_palette, dither=PILImage.Dither.NONE)
-                    
+
                     if has_transparency:
                         mask = crop_rgba.split()[3].point(lambda a: 255 if a < 128 else 0)
                         try:
@@ -206,10 +256,13 @@ class SpriteToGifPlugin(Star):
 
             output = io.BytesIO()
             duration_ms = int(duration_sec * 1000)
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms, loop=0, disposal=2, transparency=255 if has_transparency else None, optimize=False)
+
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms, loop=0,
+                           disposal=2, transparency=255 if has_transparency else None, optimize=False)
             output.seek(0)
             return f"✅ 合成成功\n{info_msg}", output
-        except Exception as e: return f"逻辑异常: {str(e)}", None
+        except Exception as e:
+            return f"逻辑异常: {str(e)}", None
 
     @filter.regex(r"(?:gif)?(变快|变慢|加速|减速)\s*[*x×]?\s*(\d+\.?\d*)?")
     async def change_gif_speed(self, event: AstrMessageEvent):
@@ -225,22 +278,18 @@ class SpriteToGifPlugin(Star):
 
         speed_ratio = 1 / factor if action in ["变快", "加速"] else factor
         action_text = "加速" if action in ["变快", "加速"] else "减速"
-        
-        img_url = self._get_image_url(event)
-        if not img_url: return 
 
-        try:
-            yield event.plain_result(f"⏳ 正在处理 {action_text} {factor}倍...")
-            await asyncio.sleep(0.5)
-        except Exception:
-            return
+        img_url = self._get_image_url(event)
+        if not img_url: return
+
+        yield event.plain_result(f"⏳ 正在处理 {action_text} {factor}倍...")
 
         img_data = await self._download_image(img_url)
         if not img_data:
             yield event.plain_result("❌ 图片下载失败")
             return
 
-        result_msg, gif_bytes = await asyncio.to_thread(self.process_speed, img_data, speed_ratio)
+        result_msg, gif_bytes = self.process_speed(img_data, speed_ratio)
 
         if gif_bytes:
             yield event.chain_result([Comp.Plain(result_msg), Comp.Image.fromBytes(gif_bytes.getvalue())])
@@ -265,103 +314,159 @@ class SpriteToGifPlugin(Star):
             if not frames: return "解析失败", None
 
             output = io.BytesIO()
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=durations, loop=0, disposal=2, dither=PILImage.Dither.NONE, optimize=False)
+            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=durations, loop=0,
+                           disposal=2, dither=PILImage.Dither.NONE, optimize=False)
             output.seek(0)
             return "✅ 变速完成", output
-        except Exception as e: return f"处理异常: {str(e)}", None
+        except Exception as e:
+            return f"处理异常: {str(e)}", None
 
     @filter.command("裁剪")
     async def crop_and_forward(self, event: AstrMessageEvent):
         msg_text = event.message_str
-        clean_text = msg_text.replace("裁剪", "")
 
+        # 1. 预处理：提取边距
+        clean_text, margins = self._parse_margins(msg_text)
+
+        # 2. 解析行列
+        match = re.search(r'(\d+)\s*[*x×]\s*(\d+)', clean_text)
+        
         rows = 0
         cols = 0
-        margin = 0
 
-        grid_match = re.search(r'(\d+)\s*[*x×]\s*(\d+)', clean_text)
-        if grid_match:
-            rows = int(grid_match.group(1))
-            cols = int(grid_match.group(2))
-            clean_text = clean_text.replace(grid_match.group(0), " ")
+        if match:
+            rows = int(match.group(1))
+            cols = int(match.group(2))
         else:
-            yield event.plain_result("❌ 格式错误，请发送如：裁剪 3*3")
-            return
+            # 修改点：如果没有指定行列，但是指定了边距，则默认按照 1x1 (单张) 处理
+            if any(v > 0 for v in margins.values()):
+                rows = 1
+                cols = 1
+            else:
+                yield event.plain_result("❌ 格式错误，请发送如：裁剪 3*3 或 裁剪 边距左2")
+                return
 
         if rows <= 0 or cols <= 0 or rows > 20 or cols > 20:
-             yield event.plain_result("⚠️ 行列数必须 >0 且 <=20")
-             return
-
-        margin_match = re.search(r'(?:边距|margin|gap)\s*(\d+)', clean_text)
-        if margin_match:
-            margin = int(margin_match.group(1))
+            yield event.plain_result("⚠️ 行列数必须 >0 且 <=20")
+            return
 
         img_url = self._get_image_url(event)
         if not img_url:
             yield event.plain_result("❌ 请发送图片带指令，或回复一张图片")
             return
-        
-        try:
-            margin_info = f", 边距{margin}px" if margin > 0 else ""
-            yield event.plain_result(f"⏳ 正在裁剪为 {rows}行 x {cols}列{margin_info}，请稍候...")
-            await asyncio.sleep(1.0) 
-        except Exception:
-            return
+
+        yield event.plain_result(f"⏳ 正在处理...")
 
         img_data = await self._download_image(img_url)
         if not img_data:
             yield event.plain_result("❌ 图片下载失败")
             return
 
-        nodes_data = await asyncio.to_thread(self.process_crop, img_data, rows, cols, margin)
+        # 3. 应用边距裁剪
+        img_data, crop_msg = self._crop_image_data(img_data, margins)
 
-        if not nodes_data:
-             yield event.plain_result("❌ 裁剪失败：图片太小或计算错误")
-             return
-
-        try:
-            nodes_list = []
-            for idx, img_bytes in enumerate(nodes_data):
-                 node = Comp.Node(
-                    name=f"图 {idx+1}",
-                    content=[Comp.Image.fromBytes(img_bytes)]
-                )
-                 nodes_list.append(node)
-            
-            nodes = Comp.Nodes(nodes=nodes_list)
-            yield event.chain_result([nodes])
-        except Exception as e:
-            yield event.plain_result(f"❌ 发送合并消息失败: {e}")
-
-    def process_crop(self, img_data: bytes, rows: int, cols: int, margin: int):
         try:
             pil_img = PILImage.open(io.BytesIO(img_data))
             pil_img = pil_img.convert("RGBA")
             width, height = pil_img.size
-            
-            content_width = width - (cols - 1) * margin
-            content_height = height - (rows - 1) * margin
-            cell_width = content_width // cols
-            cell_height = content_height // rows
+
+            cell_width = width // cols
+            cell_height = height // rows
 
             if cell_width < 1 or cell_height < 1:
-                return None
+                yield event.plain_result(f"❌ 图片太小({width}x{height})，无法按照该行列数裁剪{crop_msg}")
+                return
 
-            img_bytes_list = []
+            nodes_list = []
+            sender_name = "裁剪"
+            
+            nodes_list.append(Comp.Node(
+                name=sender_name,
+                content=[Comp.Plain(f"裁剪结果 {rows}行{cols}列{crop_msg}")]
+            ))
+
             for r in range(rows):
                 for c in range(cols):
-                    left = c * (cell_width + margin)
-                    upper = r * (cell_height + margin)
+                    left = c * cell_width
+                    upper = r * cell_height
                     right = left + cell_width
                     lower = upper + cell_height
-                    
+
                     cropped = pil_img.crop((left, upper, right, lower))
-                    
+
                     img_byte_arr = io.BytesIO()
                     cropped.save(img_byte_arr, format='PNG')
-                    img_bytes_list.append(img_byte_arr.getvalue())
-            
-            return img_bytes_list
+                    img_bytes = img_byte_arr.getvalue()
 
-        except Exception:
-            return None
+                    node = Comp.Node(
+                        name=sender_name,
+                        content=[Comp.Image.fromBytes(img_bytes)]
+                    )
+                    nodes_list.append(node)
+
+            if nodes_list:
+                nodes = Comp.Nodes(nodes=nodes_list)
+                yield event.chain_result([nodes])
+            else:
+                yield event.plain_result("❌ 裁剪处理失败，未生成有效片段")
+
+        except Exception as e:
+            yield event.plain_result(f"❌ 裁剪处理出错: {e}")
+
+    @filter.command("gif分解")
+    async def decompose_gif(self, event: AstrMessageEvent):
+        """将GIF拆解为单帧图片并以合并转发发送"""
+        img_url = self._get_image_url(event)
+        if not img_url:
+            yield event.plain_result("❌ 请发送GIF图片带指令，或回复一张GIF")
+            return
+
+        yield event.plain_result("⏳ 正在分解GIF，请稍候...")
+
+        img_data = await self._download_image(img_url)
+        if not img_data:
+            yield event.plain_result("❌ 图片下载失败")
+            return
+
+        try:
+            pil_img = PILImage.open(io.BytesIO(img_data))
+
+            # 检查是否为动画
+            if not getattr(pil_img, "is_animated", False):
+                yield event.plain_result("⚠️ 这张图片似乎不是GIF动画，无法分解。")
+                return
+
+            nodes_list = []
+            sender_name = "GIF分解助手"
+
+            # 遍历每一帧
+            MAX_FRAMES = 100
+
+            for i, frame in enumerate(ImageSequence.Iterator(pil_img)):
+                if i >= MAX_FRAMES:
+                    break
+
+                # 必须copy出来，否则指针会乱
+                frame_copy = frame.copy().convert("RGBA")
+
+                img_byte_arr = io.BytesIO()
+                frame_copy.save(img_byte_arr, format='PNG')
+                img_bytes = img_byte_arr.getvalue()
+
+                node = Comp.Node(
+                    name=sender_name,
+                    content=[
+                        Comp.Plain(f"第 {i + 1} 帧:"),
+                        Comp.Image.fromBytes(img_bytes)
+                    ]
+                )
+                nodes_list.append(node)
+
+            if nodes_list:
+                nodes = Comp.Nodes(nodes=nodes_list)
+                yield event.chain_result([nodes])
+            else:
+                yield event.plain_result("❌ 分解失败，未获取到有效帧。")
+
+        except Exception as e:
+            yield event.plain_result(f"❌ 分解出错: {e}")
