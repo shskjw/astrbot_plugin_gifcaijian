@@ -1,9 +1,3 @@
-# helloworld
-
-AstrBot 插件模板
-
-A template plugin for AstrBot plugin feature
-
-# 支持
-
-[帮助文档](https://astrbot.app)
+| <img src="./11/1.png" width="400"> | <img src="./images/cos_demo.png" width="400"> |
+| <img src="./images/figurine_demo.png" width="400"> | <img src="./images/cos_demo.png" width="400"> |
+| <img src="./images/figurine_demo.png" width="400"> |
