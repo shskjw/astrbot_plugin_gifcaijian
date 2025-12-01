@@ -18,8 +18,8 @@ except ImportError:
 @register(
     "astrbot_plugin_gifcaijian",
     "shskjw",
-    "可以裁剪和合并gif，支持视频转gif(高级版)",
-    "1.3.0",
+    "1.3.5",
+    "可以裁剪和合并gif 分解等功能（后续慢慢润化）",
     "https://github.com/shkjw/astrbot_plugin_gifcaijian",
 )
 class SpriteToGifPlugin(Star):
@@ -28,7 +28,41 @@ class SpriteToGifPlugin(Star):
         self.cfg = config if config is not None else {}
         
         if imageio is None:
-            logger.warning("插件[astrbot_plugin_gifcaijian]检测到缺少 imageio 库，[视频转gif] 功能将不可用。请运行 pip install imageio[ffmpeg]")
+            logger.warning("插件[astrbot_plugin_gifcaijian]检测到缺少 imageio 库。请运行 pip install imageio[ffmpeg]")
+
+    # --- 核心工具：统一保存动画 (支持 GIF/APNG/WebP) ---
+    def _save_animation(self, output: io.BytesIO, frames: list, duration_ms: int, loop: int = 0):
+        fmt = self.cfg.get('output_format', 'GIF').upper()
+        
+        # 1. GIF 格式 (兼容性最好)
+        if fmt == 'GIF':
+            frames[0].save(
+                output, format='GIF', save_all=True, append_images=frames[1:], 
+                duration=duration_ms, loop=loop, optimize=True, disposal=2
+            )
+            return
+
+        # 2. APNG 格式 (画质好，支持半透明)
+        elif fmt == 'APNG':
+            frames[0].save(
+                output, format='PNG', save_all=True, append_images=frames[1:], 
+                duration=duration_ms, loop=loop, optimize=True, default_image=True
+            )
+            return
+
+        # 3. WebP 格式 (体积最小，推荐)
+        elif fmt == 'WEBP':
+            frames[0].save(
+                output, format='WEBP', save_all=True, append_images=frames[1:], 
+                duration=duration_ms, loop=loop, method=3, quality=80
+            )
+            return
+
+        # 默认回退到 GIF
+        frames[0].save(
+            output, format='GIF', save_all=True, append_images=frames[1:], 
+            duration=duration_ms, loop=loop, optimize=True, disposal=2
+        )
 
     def _get_image_url(self, event: AstrMessageEvent) -> str:
         if hasattr(event, "get_images"):
@@ -51,19 +85,19 @@ class SpriteToGifPlugin(Star):
     def _get_video_source(self, event: AstrMessageEvent) -> str:
         candidates = []
         def extract_from_item(item):
-            # 1. URL
+            # URL
             url = getattr(item, 'url', None)
             if not url and isinstance(item, dict):
                 url = item.get('data', {}).get('url') or item.get('url')
             if url and isinstance(url, str) and url.startswith('http'):
                 return 100, url
-            # 2. Path
+            # Path
             path = getattr(item, 'path', None)
             if not path and isinstance(item, dict):
                 path = item.get('data', {}).get('path') or item.get('path')
             if path and isinstance(path, str) and os.path.isabs(path) and os.path.exists(path):
                 return 90, path
-            # 3. File
+            # File
             file_info = getattr(item, 'file', None)
             if not file_info and isinstance(item, dict):
                 file_info = item.get('data', {}).get('file') or item.get('file')
@@ -93,10 +127,9 @@ class SpriteToGifPlugin(Star):
         candidates.sort(key=lambda x: x[0], reverse=True)
         return candidates[0][1]
 
-    # --- 通过API解析文件ID ---
     async def _resolve_file_via_api(self, event: AstrMessageEvent, file_id: str) -> str:
         try:
-            logger.info(f"[视频转gif] 尝试通过API解析文件ID: {file_id}")
+            logger.info(f"尝试通过API解析文件ID: {file_id}")
             res = await event.bot.api.call_action("get_file", file_id=file_id)
             if not res or not isinstance(res, dict): return None
             
@@ -107,7 +140,7 @@ class SpriteToGifPlugin(Star):
             if path and os.path.exists(path): return path
             return url or path
         except Exception as e:
-            logger.warning(f"[视频转gif] API解析文件失败: {e}")
+            logger.warning(f"API解析文件失败: {e}")
             return None
 
     def _parse_video_args(self, text: str):
@@ -120,9 +153,10 @@ class SpriteToGifPlugin(Star):
             'fps': default_fps,
             'step': 1,
             'scale': default_scale,
-            'force_step': False # 新增标记，是否强制使用了抽帧语法
+            'force_step': False
         }
         
+        # 1. 时间区间 (0.0s-10.0s)
         time_range = re.search(r'(\d+(?:\.\d+)?)[sS]?\s*[-~]\s*(\d+(?:\.\d+)?)[sS]?', text)
         if time_range:
             params['start'] = float(time_range.group(1))
@@ -137,22 +171,23 @@ class SpriteToGifPlugin(Star):
                 duration = float(dur_match.group(1))
                 params['end'] = params['start'] + duration
 
+        # 2. 抽帧: 1/2 或 2/1 (取最大值)
         step_match = re.search(r'(\d+)\s*/\s*(\d+)', text)
         if step_match:
             n1 = int(step_match.group(1))
             n2 = int(step_match.group(2))
-            step_val = max(n1, n2) # 智能识别: 1/2 -> step 2
-            
+            step_val = max(n1, n2)
             if step_val > 0:
                 params['step'] = step_val
-                params['fps'] = None # 禁用FPS模式
-                params['force_step'] = True # 标记为强制抽帧模式
+                params['fps'] = None
+                params['force_step'] = True
             text = text.replace(step_match.group(0), " ")
         else:
             fps_match = re.search(r'(?:fps|帧率)\s*(\d+)', text)
             if fps_match:
                 params['fps'] = int(fps_match.group(1))
 
+        # 3. 缩放
         scale_match = re.search(r'\b(0\.\d+|1\.0)\b', text)
         if scale_match:
             params['scale'] = float(scale_match.group(1))
@@ -162,10 +197,8 @@ class SpriteToGifPlugin(Star):
 
         return params
 
-    def _worker_video_to_gif(self, video_path: str, params: dict):
-        if imageio is None:
-            return "❌ 缺少依赖库，请联系管理员安装: pip install imageio[ffmpeg]", None
-            
+    # --- 核心处理逻辑 ---
+    def _process_gif_core(self, video_path: str, params: dict, max_colors: int = 256):
         try:
             reader = imageio.get_reader(video_path, format='FFMPEG')
             meta = reader.get_meta_data()
@@ -181,32 +214,31 @@ class SpriteToGifPlugin(Star):
             max_dur_conf = self.cfg.get('max_gif_duration', 10.0)
             if (end_t - start_t) > max_dur_conf:
                 end_t = start_t + max_dur_conf
-                warn_msg = f"(已按配置限制为{max_dur_conf}s)"
+                warn_msg = f"(限时{max_dur_conf}s)"
             else:
                 warn_msg = ""
 
             end_t = min(end_t, video_duration)
             if start_t >= video_duration:
-                return f"❌ 开始时间({start_t}s) 超出了视频时长({video_duration:.1f}s)", None
+                return None, f"❌ 开始时间超限", 0
 
+            # 抽帧逻辑
             step = 1
             target_fps = 0
-            
             if params.get('force_step'):
                 step = params['step']
                 target_fps = src_fps / step
-
             elif params.get('fps'):
                 target_fps = params['fps']
                 if target_fps > src_fps: target_fps = src_fps
                 step = max(1, int(src_fps / target_fps))
-
             else:
-                step = 3 # 默认约 1/3
+                step = 3
                 target_fps = src_fps / step
 
             frames = []
-            
+            output_fmt = self.cfg.get('output_format', 'GIF').upper()
+
             for i, frame in enumerate(reader):
                 current_time = i / src_fps
                 if current_time < start_t: continue
@@ -214,40 +246,75 @@ class SpriteToGifPlugin(Star):
                     
                 if i % step == 0:
                     pil_img = PILImage.fromarray(frame)
+                    
+                    # 缩放
                     w, h = pil_img.size
                     new_w = int(w * params['scale'])
                     new_h = int(h * params['scale'])
                     pil_img = pil_img.resize((new_w, new_h), PILImage.Resampling.BILINEAR)
+                    
+                    # 仅在输出格式为 GIF 时进行颜色量化
+                    if output_fmt == 'GIF' and max_colors < 256:
+                        pil_img = pil_img.quantize(colors=max_colors, method=1, dither=PILImage.Dither.FLOYDSTEINBERG)
+                    
                     frames.append(pil_img)
                     
-                if len(frames) > 300: 
-                    warn_msg += "\n⚠️ 帧数过多已截断"
+                if len(frames) > 400:
+                    warn_msg += " [帧数截断]"
                     break
             
             reader.close()
             
             if not frames:
-                return "❌ 未提取到有效帧", None
+                return None, "❌ 无有效帧", 0
                 
             output = io.BytesIO()
             duration_ms = int(1000 / target_fps) if target_fps > 0 else 100
             
-            frames[0].save(
-                output, format='GIF', save_all=True, append_images=frames[1:], 
-                duration=duration_ms, loop=0, optimize=False, disposal=2
-            )
+            # 使用统一保存方法
+            self._save_animation(output, frames, duration_ms, loop=0)
             output.seek(0)
             
-            file_size = output.getbuffer().nbytes / 1024 / 1024
+            size_mb = output.getbuffer().nbytes / 1024 / 1024
             
-            info = f"时间: {start_t}-{end_t:.1f}s {warn_msg}\n"
-            info += f"原FPS: {src_fps:.1f} → GIF FPS: {target_fps:.1f} (抽帧:{step})\n"
-            info += f"缩放: {params['scale']} | 体积: {file_size:.2f}MB"
+            info = f"时间:{start_t}-{end_t:.1f}s {warn_msg}\n"
+            info += f"格式:{output_fmt} | FPS:{target_fps:.1f}\n"
+            info += f"缩放:{params['scale']} | 体积:{size_mb:.2f}MB"
             
-            return f"✅ 转换成功\n{info}", output
-            
+            return output, info, size_mb
+
         except Exception as e:
-            return f"❌ 转换内部出错: {repr(e)}", None
+            return None, f"内部错误: {repr(e)}", 0
+
+    # --- 工作线程 wrapper ---
+    def _worker_video_to_gif_wrapper(self, video_path: str, params: dict):
+        if imageio is None:
+            return "❌ 缺少依赖库 imageio", None
+            
+        max_colors = self.cfg.get('gif_max_colors', 256)
+        
+        # 第一次尝试
+        gif_io, msg, size_mb = self._process_gif_core(video_path, params, max_colors)
+        if not gif_io: return msg, None
+            
+        # 智能重试 (仅针对 GIF，APNG/WebP 暂不自动降级因为通常是为了画质)
+        # 如果体积 > 10MB 且是 GIF，尝试压缩
+        output_fmt = self.cfg.get('output_format', 'GIF').upper()
+        if size_mb > 10.0 and output_fmt == 'GIF':
+            new_params = params.copy()
+            new_msg_prefix = f"⚠️ 初次体积{size_mb:.1f}MB过大，自动压缩中...\n"
+            
+            new_colors = 128 if max_colors > 128 else 64
+            new_params['scale'] = round(params['scale'] * 0.8, 2)
+            if new_params['scale'] < 0.1: new_params['scale'] = 0.1
+            
+            retry_io, retry_msg, retry_size = self._process_gif_core(video_path, new_params, new_colors)
+            if retry_io and retry_size < size_mb:
+                return new_msg_prefix + retry_msg, retry_io
+            else:
+                return f"⚠️ 压缩失败({retry_size:.1f}MB)，原版:\n" + msg, gif_io
+        
+        return "✅ 转换成功\n" + msg, gif_io
 
     @filter.command("视频转gif")
     async def video_to_gif_cmd(self, event: AstrMessageEvent):
@@ -273,8 +340,9 @@ class SpriteToGifPlugin(Star):
                 yield event.plain_result(f"❌ 无法解析视频地址: {raw_source}")
                 return
 
+        fmt = self.cfg.get('output_format', 'GIF')
         time_info = f"{params['start']}s-" + (f"{params['end']}s" if params['end'] else "末尾")
-        yield event.plain_result(f"⏳ 任务已接收\n区间: {time_info}\n缩放: {params['scale']}")
+        yield event.plain_result(f"⏳ 任务已接收 ({fmt})\n区间: {time_info}\n缩放: {params['scale']}")
         
         tmp_path = ""
         is_temp_file = False
@@ -297,7 +365,7 @@ class SpriteToGifPlugin(Star):
                         
                         content_len = resp.headers.get('Content-Length')
                         if content_len and int(content_len) > max_size:
-                            yield event.plain_result(f"❌ 视频超过大小限制 ({int(content_len)/1024/1024:.1f}MB > {max_size/1024/1024}MB)")
+                            yield event.plain_result(f"❌ 视频超过大小限制")
                             if os.path.exists(tmp_path): os.remove(tmp_path)
                             return
 
@@ -307,14 +375,7 @@ class SpriteToGifPlugin(Star):
                 tmp_path = valid_source
                 is_temp_file = False
 
-            file_size_mb = os.path.getsize(tmp_path) / (1024 * 1024)
-            limit_mb = self.cfg.get('max_video_size_mb', 50.0)
-            if file_size_mb > limit_mb:
-                yield event.plain_result(f"❌ 视频太大 ({file_size_mb:.1f}MB)，配置限制为 {limit_mb}MB")
-                if is_temp_file: os.remove(tmp_path)
-                return
-
-            result_msg, gif_bytes = await asyncio.to_thread(self._worker_video_to_gif, tmp_path, params)
+            result_msg, gif_bytes = await asyncio.to_thread(self._worker_video_to_gif_wrapper, tmp_path, params)
             
             if is_temp_file and os.path.exists(tmp_path): 
                 os.remove(tmp_path)
@@ -328,7 +389,7 @@ class SpriteToGifPlugin(Star):
             if is_temp_file and tmp_path and os.path.exists(tmp_path): os.remove(tmp_path)
             yield event.plain_result(f"❌ 处理异常: {repr(e)}")
 
-    # --- 图片处理部分 ---
+    # --- 其他原有功能 ---
     def _parse_margins(self, text: str):
         margins = {'top': 0, 'bottom': 0, 'left': 0, 'right': 0}
         pattern = r'边距\s*([上下左右])?边?\s*(\d+)'
@@ -357,6 +418,15 @@ class SpriteToGifPlugin(Star):
             img.crop((l, u, r, d)).save(output, format='PNG')
             return output.getvalue(), f"\n✂️ 已裁边距: 上{margins['top']} 下{margins['bottom']} 左{margins['left']} 右{margins['right']}"
         except Exception as e: return img_data, f"\n⚠️ 边距裁剪出错: {e}"
+
+    async def _download_image(self, url: str) -> bytes:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with aiohttp.ClientSession() as session:
+            try:
+                async with session.get(url, headers=headers, timeout=30) as resp:
+                    if resp.status != 200: return None
+                    return await resp.read()
+            except: return None
 
     async def _handle_gif_task(self, event: AstrMessageEvent, algorithm_mode: int):
         msg_text = event.message_str
@@ -390,15 +460,6 @@ class SpriteToGifPlugin(Star):
         else:
             yield event.plain_result(f"❌ 失败：\n{res_msg}")
 
-    async def _download_image(self, url: str) -> bytes:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(url, headers=headers, timeout=30) as resp:
-                    if resp.status != 200: return None
-                    return await resp.read()
-            except: return None
-
     @filter.command("合成1gif")
     async def make_gif_v1(self, event: AstrMessageEvent):
         async for res in self._handle_gif_task(event, 1): yield res
@@ -420,9 +481,7 @@ class SpriteToGifPlugin(Star):
                 for c in range(cols):
                     frames.append(img.crop((c*cw, r*ch, (c+1)*cw, (r+1)*ch)))
             output = io.BytesIO()
-            disp = 2 if img.getextrema()[3][0] < 255 else 0
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
-                           duration=int(duration_sec*1000), loop=0, disposal=disp, optimize=False)
+            self._save_animation(output, frames, int(duration_sec*1000), loop=0)
             output.seek(0)
             return f"✅ 合成成功\n算法1 | {w}x{h} | {rows}行{cols}列", output
         except Exception as e: return f"逻辑异常: {e}", None
@@ -450,9 +509,13 @@ class SpriteToGifPlugin(Star):
                         frame.paste(255, mask=mask)
                     frames.append(frame)
             output = io.BytesIO()
-            frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
+            fmt = self.cfg.get('output_format', 'GIF').upper()
+            if fmt == 'GIF':
+                 frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
                            duration=int(duration_sec*1000), loop=0, disposal=2, 
-                           transparency=255 if has_trans else None, optimize=False)
+                           transparency=255 if has_trans else None, optimize=True)
+            else:
+                 self._save_animation(output, frames, int(duration_sec*1000), loop=0)
             output.seek(0)
             return f"✅ 合成成功\n算法2 | {w}x{h} | {rows}行{cols}列", output
         except Exception as e: return f"逻辑异常: {e}", None
@@ -487,8 +550,9 @@ class SpriteToGifPlugin(Star):
                 durs.append(max(20, int(frame.info.get('duration', 100) * ratio)))
                 frames.append(frame.copy())
             output = io.BytesIO()
+            # 变速功能默认保存为GIF以确保兼容性
             frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], 
-                           duration=durs, loop=0, disposal=2, optimize=False)
+                           duration=durs, loop=0, disposal=2, optimize=True)
             output.seek(0)
             return "✅ 变速完成", output
         except Exception as e: return f"异常: {e}", None
