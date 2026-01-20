@@ -22,7 +22,7 @@ except ImportError:
     "astrbot_plugin_gifcaijian",
     "shskjw",
     "支持GIF/APNG/WebP转换、裁剪、本地图片转线稿及多图合成(终极稳定版)",
-    "1.4.0",
+    "1.4.1",
     "https://github.com/shkjw/astrbot_plugin_gifcaijian",
 )
 class SpriteToGifPlugin(Star):
