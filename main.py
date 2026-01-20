@@ -562,26 +562,44 @@ class SpriteToGifPlugin(Star):
         except Exception as e:
             return f"逻辑异常: {e}", None
 
-    @filter.regex(r"(?:gif)?(变快|变慢|加速|减速)\s*[*x×]?\s*(\d+\.?\d*)?")
-    async def change_gif_speed(self, event: AstrMessageEvent):
+    # --- 统一变速处理逻辑 ---
+    async def _change_speed_impl(self, event: AstrMessageEvent, is_accelerate: bool):
         msg = event.message_str
-        match = re.search(r"(?:gif)?(变快|变慢|加速|减速)\s*[*x×]?\s*(\d+\.?\d*)?", msg)
-        if not match: return
-        action, factor = match.group(1), float(match.group(2) or 2.0)
+        # 尝试从消息中提取倍数参数
+        factor = 2.0
+        # 匹配浮点数，忽略可能存在的文字干扰
+        num_match = re.search(r"(\d+\.?\d*)", msg)
+        if num_match:
+            factor = float(num_match.group(1))
+        
         factor = max(0.1, min(factor, 20.0))
-        ratio = 1 / factor if action in ["变快", "加速"] else factor
+        ratio = 1 / factor if is_accelerate else factor
+        action_name = "加速" if is_accelerate else "减速"
+
         img_url = self._get_image_url(event)
         if not img_url: return
-        yield event.plain_result(f"⏳ 正在处理 {action} {factor}倍...")
+
+        yield event.plain_result(f"⏳ 正在处理 {action_name} {factor}倍...")
         img_data = await self._download_image(img_url)
         if not img_data:
             yield event.plain_result("❌ 下载失败")
             return
+
         res_msg, gif_bytes = await asyncio.to_thread(self.process_speed, img_data, ratio)
         if gif_bytes:
             yield event.chain_result([Comp.Plain(res_msg), Comp.Image.fromBytes(gif_bytes.getvalue())])
         else:
             yield event.plain_result(f"❌ 失败：{res_msg}")
+
+    @filter.command("加速")
+    @filter.regex(r"(?:gif)?(加速|变快)\s*[*x×]?\s*(\d+\.?\d*)?")
+    async def accelerate_gif(self, event: AstrMessageEvent):
+        async for res in self._change_speed_impl(event, True): yield res
+
+    @filter.command("减速")
+    @filter.regex(r"(?:gif)?(减速|变慢)\s*[*x×]?\s*(\d+\.?\d*)?")
+    async def decelerate_gif(self, event: AstrMessageEvent):
+        async for res in self._change_speed_impl(event, False): yield res
 
     def process_speed(self, img_data: bytes, ratio: float):
         try:
