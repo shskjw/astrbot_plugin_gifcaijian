@@ -49,23 +49,43 @@ class SpriteToGifPlugin(Star):
             frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:], duration=duration_ms,
                            loop=loop, optimize=True, disposal=2)
 
-    # --- 辅助方法: 获取单张图片URL (旧逻辑保留兼容) ---
+    # --- 辅助方法: 获取单张图片URL (增强版) ---
     def _get_image_url(self, event: AstrMessageEvent) -> str:
-        if hasattr(event, "get_images"):
-            images = event.get_images()
-            if images: return images[0].url
-
+        """获取目标图片URL：优先回复的图片 -> 当前消息的图片 -> At对象的头像"""
+        
+        # 1. 检查回复链
         if hasattr(event.message_obj, "message"):
             for seg in event.message_obj.message:
                 if isinstance(seg, Comp.Reply) and seg.chain:
                     for item in seg.chain:
-                        if isinstance(item, Comp.Image) and item.url: return item.url
+                        if isinstance(item, Comp.Image) and item.url: 
+                            return item.url
                         if isinstance(item, dict) and item.get('type') == 'image':
-                            return item.get('data', {}).get('url') or item.get('url')
-                if isinstance(seg, dict) and seg.get('type') == 'image':
-                    return seg.get('data', {}).get('url') or seg.get('url')
+                            return item.get('data', {}).get('url') or item.get('url') or item.get('file')
+
+        # 2. 检查当前消息中的图片
+        # 优先使用 AstrBot 提供的便捷方法
+        if hasattr(event, "get_images"):
+            images = event.get_images()
+            if images: return images[0].url
+            
+        # 再次手动检查 chain (防止便捷方法遗漏)
+        if hasattr(event.message_obj, "message"):
+            for seg in event.message_obj.message:
                 if isinstance(seg, Comp.Image) and seg.url:
                     return seg.url
+                if isinstance(seg, dict) and seg.get('type') == 'image':
+                    return seg.get('data', {}).get('url') or seg.get('url') or seg.get('file')
+
+        # 3. 检查 At (获取头像)
+        if hasattr(event.message_obj, "message"):
+            for seg in event.message_obj.message:
+                if isinstance(seg, Comp.At):
+                    # 尝试排除机器人自己 (如果能获取到 self_id)
+                    # 此处假设用户 At 别人是为了获取头像
+                    user_id = str(seg.qq)
+                    return f"https://q1.qlogo.cn/g?b=qq&nk={user_id}&s=640"
+
         return None
 
     # --- 新增: 递归提取所有图片 (支持合并转发、回复等) ---
@@ -75,7 +95,7 @@ class SpriteToGifPlugin(Star):
             # 1. 直接是 Image 组件
             if isinstance(item, Comp.Image) and item.url:
                 urls.append(item.url)
-            # 2. 字典格式 (常见于 raw payload)
+            # 2. 字典格式
             elif isinstance(item, dict):
                 if item.get('type') == 'image':
                     url = item.get('data', {}).get('url') or item.get('url') or item.get('file')
@@ -83,14 +103,13 @@ class SpriteToGifPlugin(Star):
                         urls.append(url)
                 # 3. 嵌套节点 (Forward Node)
                 elif item.get('type') == 'node':
-                    # 尝试解析 content
                     content = item.get('data', {}).get('content') or item.get('content')
                     if isinstance(content, list):
                         urls.extend(self._extract_images_from_chain(content))
-            # 4. Reply 组件 (里面可能包含引用的图片)
+            # 4. Reply 组件
             elif isinstance(item, Comp.Reply) and item.chain:
                 urls.extend(self._extract_images_from_chain(item.chain))
-            # 5. Nodes 组件 (AstrBot 封装的转发节点)
+            # 5. Nodes 组件
             elif isinstance(item, Comp.Nodes):
                 if item.nodes:
                     for node in item.nodes:
@@ -99,20 +118,28 @@ class SpriteToGifPlugin(Star):
         return urls
 
     async def _get_all_image_urls(self, event: AstrMessageEvent) -> list[str]:
-        """获取上下文中所有的图片链接（包括当前消息、回复的消息、转发消息）"""
+        """获取上下文中所有的图片链接（包括当前消息、回复的消息、转发消息、At头像）"""
         urls = []
 
-        # 1. 检查 event.message_obj.message (包含当前消息和可能的 Reply/Forward 结构)
+        # 1. 检查 event.message_obj.message
         if hasattr(event.message_obj, "message") and isinstance(event.message_obj.message, list):
             urls.extend(self._extract_images_from_chain(event.message_obj.message))
 
-        # 2. 如果 event 直接提供了 get_images (通常是当前消息的直接图片)
-        #    为了防止重复，如果上面已经提取到了，这里可以作为补充
+        # 2. 补充 get_images
         if hasattr(event, "get_images"):
             imgs = event.get_images()
             for img in imgs:
                 if img.url and img.url not in urls:
                     urls.append(img.url)
+        
+        # 3. 补充 At 头像
+        if hasattr(event.message_obj, "message"):
+            for seg in event.message_obj.message:
+                if isinstance(seg, Comp.At):
+                    uid = str(seg.qq)
+                    url = f"https://q1.qlogo.cn/g?b=qq&nk={uid}&s=640"
+                    if url not in urls:
+                        urls.append(url)
 
         # 去重但保持顺序
         seen = set()
@@ -830,7 +857,7 @@ class SpriteToGifPlugin(Star):
             return f"❌ 处理失败: {repr(e)}\n{traceback.format_exc()}", None
 
     def _age_single_frame(self, img: PILImage.Image, times: int) -> PILImage.Image:
-        """对单帧图片进行做旧处理"""
+        """对单帧图片进行做旧处理 - 渐进式做旧"""
         import random
         
         # 确保是RGB模式
@@ -838,61 +865,66 @@ class SpriteToGifPlugin(Star):
             img = img.convert("RGB")
         
         for i in range(times):
-            # === 1. 绿色通道偏移 (变绿) ===
-            # 早期压缩算法对色彩通道处理不均，绿色通道容易被增强
-            r, g, b = img.split()
-            
-            # 绿色增强，红蓝减弱 (模拟色差)
-            # 使用固定值避免lambda闭包问题
-            green_boost = min(25, 3 + i * 2)  # 随着次数增加，绿色越强
-            red_reduce = random.randint(1, 5)
-            blue_reduce = random.randint(0, 3)
-            
-            # 使用函数工厂避免闭包问题
-            def make_green_func(boost):
-                return lambda x: min(255, x + boost)
-            def make_reduce_func(reduce_val):
-                return lambda x: max(0, x - reduce_val)
-            
-            g = g.point(make_green_func(green_boost))
-            r = r.point(make_reduce_func(red_reduce))
-            b = b.point(make_reduce_func(blue_reduce))
-            
-            img = PILImage.merge("RGB", (r, g, b))
+            # === 1. 绿色通道偏移 (变绿) - 渐进式，不是每次都加 ===
+            # 只在特定轮次进行色彩偏移，让变化更加渐进
+            if i % 3 == 0:  # 每3次做一次色彩偏移
+                r, g, b = img.split()
+                
+                # 非常轻微的绿色增强 (每次只加1-2)
+                green_boost = random.randint(1, 2)
+                red_reduce = random.randint(0, 1)
+                blue_reduce = random.randint(0, 1)
+                
+                # 使用函数工厂避免闭包问题
+                def make_add_func(val):
+                    return lambda x: min(255, x + val)
+                def make_sub_func(val):
+                    return lambda x: max(0, x - val)
+                
+                g = g.point(make_add_func(green_boost))
+                if red_reduce > 0:
+                    r = r.point(make_sub_func(red_reduce))
+                if blue_reduce > 0:
+                    b = b.point(make_sub_func(blue_reduce))
+                
+                img = PILImage.merge("RGB", (r, g, b))
             
             # === 2. JPEG压缩失真 (核心做旧效果) ===
             # 模拟多次保存/转发的压缩损失
-            quality = max(20, 65 - i * 5)  # 质量递减，但不要太低
+            # 质量从70逐渐降到25，变化更平缓
+            quality = max(25, 70 - i * 3)
             temp_io = io.BytesIO()
             img.save(temp_io, format='JPEG', quality=quality)
             temp_io.seek(0)
             img = PILImage.open(temp_io).convert("RGB")
             
-            # === 3. 轻微模糊 (变糊) ===
-            if i % 2 == 0:  # 每隔一次做一次模糊
-                blur_radius = 0.3 + i * 0.08
+            # === 3. 轻微模糊 (变糊) - 每3次做一次 ===
+            if i % 3 == 0:
+                blur_radius = 0.2 + (i // 3) * 0.1  # 非常轻微的模糊
                 img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             
-            # === 4. 轻微锐化 (模拟过度锐化的"塑料感") ===
-            if i % 3 == 1:
+            # === 4. 轻微锐化 (模拟过度锐化的"塑料感") - 偶尔做 ===
+            if i % 5 == 2:
                 img = img.filter(ImageFilter.SHARPEN)
             
-            # === 5. 降低饱和度 (颜色变脏) ===
-            enhancer = ImageEnhance.Color(img)
-            saturation = max(0.65, 1.0 - i * 0.04)
-            img = enhancer.enhance(saturation)
+            # === 5. 轻微降低饱和度 (颜色变脏) ===
+            # 变化更加平缓
+            if i % 2 == 0:
+                enhancer = ImageEnhance.Color(img)
+                saturation = max(0.85, 1.0 - 0.015)  # 每次只降1.5%
+                img = enhancer.enhance(saturation)
             
-            # === 6. 降低对比度 (变灰暗) ===
-            enhancer = ImageEnhance.Contrast(img)
-            contrast = max(0.75, 1.0 - i * 0.025)
-            img = enhancer.enhance(contrast)
+            # === 6. 轻微降低对比度 (变灰暗) ===
+            if i % 2 == 1:
+                enhancer = ImageEnhance.Contrast(img)
+                contrast = max(0.85, 1.0 - 0.01)  # 每次只降1%
+                img = enhancer.enhance(contrast)
             
-            # === 7. 可选: 缩放再放大 (像素化) - 仅在高次数时 ===
-            if times >= 8 and i == times // 2:
+            # === 7. 缩放再放大 (像素化) - 仅在高次数时 ===
+            if times >= 15 and i == times // 2:
                 w, h = img.size
-                if w > 50 and h > 50:  # 确保图片足够大
-                    # 缩小到75%再放大回来，产生像素损失
-                    small = img.resize((int(w * 0.75), int(h * 0.75)), PILImage.Resampling.BILINEAR)
+                if w > 50 and h > 50:
+                    small = img.resize((int(w * 0.8), int(h * 0.8)), PILImage.Resampling.BILINEAR)
                     img = small.resize((w, h), PILImage.Resampling.BILINEAR)
         
         return img
