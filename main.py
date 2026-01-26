@@ -22,7 +22,7 @@ except ImportError:
     "astrbot_plugin_gifcaijian",
     "shskjw",
     "支持GIF/APNG/WebP转换、裁剪、本地图片转线稿及多图合成(终极稳定版)",
-    "1.4.1",
+    "1.4.2",
     "https://github.com/shkjw/astrbot_plugin_gifcaijian",
 )
 class SpriteToGifPlugin(Star):
@@ -757,6 +757,167 @@ class SpriteToGifPlugin(Star):
 
         except Exception as e:
             return f"合成出错: {repr(e)}", None
+
+    # --- 新增: 表情包做旧功能 (模拟早期互联网传播效果) ---
+    def _worker_age_meme(self, img_data: bytes, times: int, is_animated: bool = False) -> tuple[str, bytes]:
+        """
+        模拟早期互联网图片传播的做旧效果:
+        1. 绿色通道增强 (变绿)
+        2. 低质量JPEG反复压缩 (马赛克失真)
+        3. 模糊处理 (变糊)
+        4. 饱和度/对比度调整 (颜色脏化)
+        5. 可选: 添加轻微噪点
+        """
+        try:
+            img = PILImage.open(io.BytesIO(img_data))
+            
+            # 处理动图: 逐帧做旧
+            if getattr(img, "is_animated", False) and is_animated:
+                frames = []
+                durations = []
+                for frame in ImageSequence.Iterator(img):
+                    durations.append(frame.info.get('duration', 100))
+                    aged_frame = self._age_single_frame(frame.convert("RGB"), times)
+                    frames.append(aged_frame)
+                
+                output = io.BytesIO()
+                frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:],
+                               duration=durations, loop=0, disposal=2, optimize=True)
+                output.seek(0)
+                return f"✅ 做旧成功 (动图, {len(frames)}帧, {times}次传播)", output.getvalue()
+            else:
+                # 静态图处理
+                if getattr(img, "is_animated", False):
+                    img.seek(0)
+                img = img.convert("RGB")
+                aged_img = self._age_single_frame(img, times)
+                
+                output = io.BytesIO()
+                # 最终以中低质量JPEG保存，增加"古早"感
+                final_quality = max(30, 70 - times * 3)
+                aged_img.save(output, format='JPEG', quality=final_quality)
+                return f"✅ 做旧成功 ({times}次传播, 最终质量{final_quality}%)", output.getvalue()
+                
+        except Exception as e:
+            return f"❌ 处理失败: {repr(e)}", None
+
+    def _age_single_frame(self, img: PILImage.Image, times: int) -> PILImage.Image:
+        """对单帧图片进行做旧处理"""
+        import random
+        
+        for i in range(times):
+            # === 1. 绿色通道偏移 (变绿) ===
+            # 早期压缩算法对色彩通道处理不均，绿色通道容易被增强
+            r, g, b = img.split()
+            
+            # 绿色增强，红蓝减弱 (模拟色差)
+            green_boost = min(30, 5 + i * 2)  # 随着次数增加，绿色越强
+            g = g.point(lambda x: min(255, x + green_boost))
+            r = r.point(lambda x: max(0, x - random.randint(2, 8)))
+            b = b.point(lambda x: max(0, x - random.randint(1, 5)))
+            
+            img = PILImage.merge("RGB", (r, g, b))
+            
+            # === 2. JPEG压缩失真 (核心做旧效果) ===
+            # 模拟多次保存/转发的压缩损失
+            quality = max(15, 60 - i * 8)  # 质量递减
+            temp_io = io.BytesIO()
+            img.save(temp_io, format='JPEG', quality=quality)
+            temp_io.seek(0)
+            img = PILImage.open(temp_io).convert("RGB")
+            
+            # === 3. 轻微模糊 (变糊) ===
+            if i % 2 == 0:  # 每隔一次做一次模糊
+                img = img.filter(ImageFilter.GaussianBlur(radius=0.5 + i * 0.1))
+            
+            # === 4. 轻微锐化 (模拟过度锐化的"塑料感") ===
+            if i % 3 == 0:
+                img = img.filter(ImageFilter.SHARPEN)
+            
+            # === 5. 降低饱和度 (颜色变脏) ===
+            enhancer = ImageEnhance.Color(img)
+            saturation = max(0.6, 1.0 - i * 0.05)
+            img = enhancer.enhance(saturation)
+            
+            # === 6. 降低对比度 (变灰暗) ===
+            enhancer = ImageEnhance.Contrast(img)
+            contrast = max(0.7, 1.0 - i * 0.03)
+            img = enhancer.enhance(contrast)
+            
+            # === 7. 可选: 缩放再放大 (像素化) ===
+            if times >= 5 and i == times // 2:
+                w, h = img.size
+                # 缩小到70%再放大回来，产生像素损失
+                small = img.resize((int(w * 0.7), int(h * 0.7)), PILImage.Resampling.BILINEAR)
+                img = small.resize((w, h), PILImage.Resampling.BILINEAR)
+        
+        return img
+
+    @filter.command("表情包做旧")
+    @filter.regex(r"(?:表情包?)?做旧\s*(\d+)?")
+    async def age_meme(self, event: AstrMessageEvent):
+        """
+        表情包做旧功能，模拟早期互联网图片传播效果
+        用法：表情包做旧 [次数]
+        示例：表情包做旧 10 (做旧10次，数字越大越绿越糊)
+        建议：1-5次轻度做旧，5-10次中度做旧，10-20次重度做旧
+        """
+        msg_text = event.message_str
+        
+        # 解析做旧次数
+        times = 5  # 默认5次
+        num_match = re.search(r'做旧\s*(\d+)', msg_text)
+        if num_match:
+            times = int(num_match.group(1))
+        else:
+            # 尝试匹配其他数字
+            num_match = re.search(r'(\d+)', msg_text)
+            if num_match:
+                times = int(num_match.group(1))
+        
+        # 限制范围
+        times = max(1, min(times, 50))  # 1-50次
+        
+        img_url = self._get_image_url(event)
+        if not img_url:
+            yield event.plain_result("❌ 请发送图片或回复图片\n用法: 表情包做旧 [次数]\n次数越大越绿越糊 (建议1-20)")
+            return
+        
+        # 根据次数给出提示
+        if times <= 5:
+            level = "轻度做旧 (微微泛绿)"
+        elif times <= 10:
+            level = "中度做旧 (明显发绿变糊)"
+        elif times <= 20:
+            level = "重度做旧 (经典老图风格)"
+        else:
+            level = "极限做旧 (赛博遗产级别)"
+        
+        yield event.plain_result(f"⏳ 正在做旧... ({times}次传播, {level})")
+        
+        img_data = await self._download_image(img_url)
+        if not img_data:
+            yield event.plain_result("❌ 图片下载失败")
+            return
+        
+        # 检测是否是动图
+        try:
+            test_img = PILImage.open(io.BytesIO(img_data))
+            is_animated = getattr(test_img, "is_animated", False)
+        except:
+            is_animated = False
+        
+        res_msg, result_bytes = await asyncio.to_thread(
+            self._worker_age_meme, img_data, times, is_animated
+        )
+        
+        if result_bytes:
+            yield event.chain_result([
+                Comp.Plain(f"{res_msg}\n💡 {level}"),
+                Comp.Image.fromBytes(result_bytes)
+            ])
+        else:
+            yield event.plain_result(res_msg)
 
     @filter.command("多图合成gif")
     async def multi_img_gif(self, event: AstrMessageEvent):
