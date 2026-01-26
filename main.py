@@ -759,36 +759,63 @@ class SpriteToGifPlugin(Star):
             return f"合成出错: {repr(e)}", None
 
     # --- 新增: 表情包做旧功能 (模拟早期互联网传播效果) ---
-    def _worker_age_meme(self, img_data: bytes, times: int, is_animated: bool = False) -> tuple[str, bytes]:
+    def _worker_age_meme(self, img_data: bytes, times: int) -> tuple[str, bytes]:
         """
         模拟早期互联网图片传播的做旧效果:
         1. 绿色通道增强 (变绿)
         2. 低质量JPEG反复压缩 (马赛克失真)
         3. 模糊处理 (变糊)
         4. 饱和度/对比度调整 (颜色脏化)
-        5. 可选: 添加轻微噪点
+        自动检测GIF并逐帧处理后重新合成
         """
         try:
             img = PILImage.open(io.BytesIO(img_data))
             
-            # 处理动图: 逐帧做旧
-            if getattr(img, "is_animated", False) and is_animated:
+            # 自动检测是否是动图 (GIF/APNG/WebP动图)
+            is_animated = getattr(img, "is_animated", False)
+            
+            if is_animated:
+                # === 处理动图: 分解 -> 逐帧做旧 -> 重新合成 ===
                 frames = []
                 durations = []
+                
+                # 获取所有帧
                 for frame in ImageSequence.Iterator(img):
-                    durations.append(frame.info.get('duration', 100))
-                    aged_frame = self._age_single_frame(frame.convert("RGB"), times)
+                    dur = frame.info.get('duration', 100)
+                    if dur <= 0:
+                        dur = 100
+                    durations.append(dur)
+                    # 复制帧并转换为RGB进行做旧处理
+                    frame_copy = frame.copy().convert("RGB")
+                    aged_frame = self._age_single_frame(frame_copy, times)
+                    # 转换回P模式以便GIF保存 (带调色板)
                     frames.append(aged_frame)
                 
+                if not frames:
+                    return "❌ 无法读取动图帧", None
+                
+                # 将RGB帧转换为调色板模式以生成GIF
+                gif_frames = []
+                for f in frames:
+                    # 量化为256色
+                    p_frame = f.convert("P", palette=PILImage.Palette.ADAPTIVE, colors=256)
+                    gif_frames.append(p_frame)
+                
                 output = io.BytesIO()
-                frames[0].save(output, format='GIF', save_all=True, append_images=frames[1:],
-                               duration=durations, loop=0, disposal=2, optimize=True)
+                gif_frames[0].save(
+                    output, 
+                    format='GIF', 
+                    save_all=True, 
+                    append_images=gif_frames[1:],
+                    duration=durations, 
+                    loop=0, 
+                    disposal=2, 
+                    optimize=False
+                )
                 output.seek(0)
-                return f"✅ 做旧成功 (动图, {len(frames)}帧, {times}次传播)", output.getvalue()
+                return f"✅ 做旧成功 (动图 {len(frames)}帧, {times}次传播)", output.getvalue()
             else:
-                # 静态图处理
-                if getattr(img, "is_animated", False):
-                    img.seek(0)
+                # === 静态图处理 ===
                 img = img.convert("RGB")
                 aged_img = self._age_single_frame(img, times)
                 
@@ -796,14 +823,19 @@ class SpriteToGifPlugin(Star):
                 # 最终以中低质量JPEG保存，增加"古早"感
                 final_quality = max(30, 70 - times * 3)
                 aged_img.save(output, format='JPEG', quality=final_quality)
-                return f"✅ 做旧成功 ({times}次传播, 最终质量{final_quality}%)", output.getvalue()
+                return f"✅ 做旧成功 ({times}次传播, 质量{final_quality}%)", output.getvalue()
                 
         except Exception as e:
-            return f"❌ 处理失败: {repr(e)}", None
+            import traceback
+            return f"❌ 处理失败: {repr(e)}\n{traceback.format_exc()}", None
 
     def _age_single_frame(self, img: PILImage.Image, times: int) -> PILImage.Image:
         """对单帧图片进行做旧处理"""
         import random
+        
+        # 确保是RGB模式
+        if img.mode != "RGB":
+            img = img.convert("RGB")
         
         for i in range(times):
             # === 1. 绿色通道偏移 (变绿) ===
@@ -811,16 +843,26 @@ class SpriteToGifPlugin(Star):
             r, g, b = img.split()
             
             # 绿色增强，红蓝减弱 (模拟色差)
-            green_boost = min(30, 5 + i * 2)  # 随着次数增加，绿色越强
-            g = g.point(lambda x: min(255, x + green_boost))
-            r = r.point(lambda x: max(0, x - random.randint(2, 8)))
-            b = b.point(lambda x: max(0, x - random.randint(1, 5)))
+            # 使用固定值避免lambda闭包问题
+            green_boost = min(25, 3 + i * 2)  # 随着次数增加，绿色越强
+            red_reduce = random.randint(1, 5)
+            blue_reduce = random.randint(0, 3)
+            
+            # 使用函数工厂避免闭包问题
+            def make_green_func(boost):
+                return lambda x: min(255, x + boost)
+            def make_reduce_func(reduce_val):
+                return lambda x: max(0, x - reduce_val)
+            
+            g = g.point(make_green_func(green_boost))
+            r = r.point(make_reduce_func(red_reduce))
+            b = b.point(make_reduce_func(blue_reduce))
             
             img = PILImage.merge("RGB", (r, g, b))
             
             # === 2. JPEG压缩失真 (核心做旧效果) ===
             # 模拟多次保存/转发的压缩损失
-            quality = max(15, 60 - i * 8)  # 质量递减
+            quality = max(20, 65 - i * 5)  # 质量递减，但不要太低
             temp_io = io.BytesIO()
             img.save(temp_io, format='JPEG', quality=quality)
             temp_io.seek(0)
@@ -828,28 +870,30 @@ class SpriteToGifPlugin(Star):
             
             # === 3. 轻微模糊 (变糊) ===
             if i % 2 == 0:  # 每隔一次做一次模糊
-                img = img.filter(ImageFilter.GaussianBlur(radius=0.5 + i * 0.1))
+                blur_radius = 0.3 + i * 0.08
+                img = img.filter(ImageFilter.GaussianBlur(radius=blur_radius))
             
             # === 4. 轻微锐化 (模拟过度锐化的"塑料感") ===
-            if i % 3 == 0:
+            if i % 3 == 1:
                 img = img.filter(ImageFilter.SHARPEN)
             
             # === 5. 降低饱和度 (颜色变脏) ===
             enhancer = ImageEnhance.Color(img)
-            saturation = max(0.6, 1.0 - i * 0.05)
+            saturation = max(0.65, 1.0 - i * 0.04)
             img = enhancer.enhance(saturation)
             
             # === 6. 降低对比度 (变灰暗) ===
             enhancer = ImageEnhance.Contrast(img)
-            contrast = max(0.7, 1.0 - i * 0.03)
+            contrast = max(0.75, 1.0 - i * 0.025)
             img = enhancer.enhance(contrast)
             
-            # === 7. 可选: 缩放再放大 (像素化) ===
-            if times >= 5 and i == times // 2:
+            # === 7. 可选: 缩放再放大 (像素化) - 仅在高次数时 ===
+            if times >= 8 and i == times // 2:
                 w, h = img.size
-                # 缩小到70%再放大回来，产生像素损失
-                small = img.resize((int(w * 0.7), int(h * 0.7)), PILImage.Resampling.BILINEAR)
-                img = small.resize((w, h), PILImage.Resampling.BILINEAR)
+                if w > 50 and h > 50:  # 确保图片足够大
+                    # 缩小到75%再放大回来，产生像素损失
+                    small = img.resize((int(w * 0.75), int(h * 0.75)), PILImage.Resampling.BILINEAR)
+                    img = small.resize((w, h), PILImage.Resampling.BILINEAR)
         
         return img
 
@@ -900,15 +944,9 @@ class SpriteToGifPlugin(Star):
             yield event.plain_result("❌ 图片下载失败")
             return
         
-        # 检测是否是动图
-        try:
-            test_img = PILImage.open(io.BytesIO(img_data))
-            is_animated = getattr(test_img, "is_animated", False)
-        except:
-            is_animated = False
-        
+        # 自动检测动图类型并处理
         res_msg, result_bytes = await asyncio.to_thread(
-            self._worker_age_meme, img_data, times, is_animated
+            self._worker_age_meme, img_data, times
         )
         
         if result_bytes:
